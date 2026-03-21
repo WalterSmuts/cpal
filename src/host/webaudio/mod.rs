@@ -17,9 +17,35 @@ use crate::{
     SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
+use std::cell::RefCell;
 use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+thread_local! {
+    static SHARED_AUDIO_CONTEXT: RefCell<Option<Arc<AudioContext>>> = RefCell::new(None);
+}
+
+fn get_or_create_audio_context(sample_rate: SampleRate) -> Result<Arc<AudioContext>, BuildStreamError> {
+    SHARED_AUDIO_CONTEXT.with(|cell| {
+        let mut ctx_opt = cell.borrow_mut();
+        if let Some(ctx) = ctx_opt.as_ref() {
+            return Ok(ctx.clone());
+        }
+        let stream_opts = AudioContextOptions::new();
+        stream_opts.set_sample_rate(sample_rate as f32);
+        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
+            |err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            },
+        )?;
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx = Arc::new(ctx);
+        *ctx_opt = Some(ctx.clone());
+        Ok(ctx)
+    })
+}
 
 /// Type alias for shared closure handles used in audio callbacks
 
@@ -232,20 +258,8 @@ impl DeviceTrait for Device {
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
         let error_callback = Arc::new(Mutex::new(Box::new(error_callback)));
 
-        // Create the AudioContext for input.
-        let stream_opts = AudioContextOptions::new();
-        stream_opts.set_sample_rate(config.sample_rate as f32);
-        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{:?}", err);
-                let err = BackendSpecificError { description };
-                err.into()
-            },
-        )?;
-
-        // SAFETY: WASM is single-threaded
-        #[allow(clippy::arc_with_non_send_sync)]
-        let ctx = Arc::new(ctx);
+        // Reuse shared AudioContext for input.
+        let ctx = get_or_create_audio_context(config.sample_rate)?;
 
         // Create a ScriptProcessorNode for capturing input samples.
         let script_node = ctx
@@ -388,19 +402,8 @@ impl DeviceTrait for Device {
 
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
 
-        // Create the WebAudio context.
-        let stream_opts = AudioContextOptions::new();
-        stream_opts.set_sample_rate(config.sample_rate as f32);
-        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{:?}", err);
-                BackendSpecificError { description }.into()
-            },
-        )?;
-
-        // SAFETY: WASM is single-threaded
-        #[allow(clippy::arc_with_non_send_sync)]
-        let ctx = Arc::new(ctx);
+        // Reuse shared AudioContext for output.
+        let ctx = get_or_create_audio_context(config.sample_rate)?;
 
         // Create a ScriptProcessorNode for gapless output.
         let script_node = ctx
@@ -504,7 +507,7 @@ impl StreamTrait for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let _ = self.ctx.close();
+        // Don't close the shared AudioContext — other streams may still use it.
     }
 }
 
