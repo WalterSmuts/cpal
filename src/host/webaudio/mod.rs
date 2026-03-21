@@ -96,7 +96,7 @@ impl Devices {
 impl Device {
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
         Ok(DeviceDescriptionBuilder::new("Default Device".to_string())
-            .direction(crate::DeviceDirection::Output)
+            .direction(crate::DeviceDirection::Duplex)
             .build())
     }
 
@@ -110,8 +110,21 @@ impl Device {
     fn supported_input_configs(
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        // TODO
-        Ok(Vec::new().into_iter())
+        let buffer_size = SupportedBufferSize::Range {
+            min: MIN_BUFFER_SIZE,
+            max: MAX_BUFFER_SIZE,
+        };
+        // Input only supports mono and stereo
+        let configs: Vec<_> = (MIN_CHANNELS..=2)
+            .map(|channels| SupportedStreamConfigRange {
+                channels,
+                min_sample_rate: MIN_SAMPLE_RATE,
+                max_sample_rate: MAX_SAMPLE_RATE,
+                buffer_size,
+                sample_format: SUPPORTED_SAMPLE_FORMAT,
+            })
+            .collect();
+        Ok(configs.into_iter())
     }
 
     fn supported_output_configs(
@@ -134,8 +147,14 @@ impl Device {
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        // TODO
-        Err(DefaultStreamConfigError::StreamTypeNotSupported)
+        const EXPECT: &str = "expected at least one valid webaudio input stream config";
+        let config = self
+            .supported_input_configs()
+            .expect(EXPECT)
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .unwrap()
+            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+        Ok(config)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
@@ -529,8 +548,11 @@ impl Iterator for Devices {
 }
 
 fn default_input_device() -> Option<Device> {
-    // TODO
-    None
+    if is_webaudio_available() {
+        Some(Device)
+    } else {
+        None
+    }
 }
 
 fn default_output_device() -> Option<Device> {
