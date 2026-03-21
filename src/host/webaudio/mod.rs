@@ -205,18 +205,160 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: StreamConfig,
-        _sample_format: SampleFormat,
-        _data_callback: D,
-        _error_callback: E,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        data_callback: D,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        // TODO
-        Err(BuildStreamError::StreamConfigNotSupported)
+        if !valid_config(config, sample_format) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+
+        let n_channels = config.channels as usize;
+
+        let buffer_size_frames = match config.buffer_size {
+            BufferSize::Fixed(v) => {
+                if !(MIN_BUFFER_SIZE..=MAX_BUFFER_SIZE).contains(&v) {
+                    return Err(BuildStreamError::StreamConfigNotSupported);
+                }
+                v as usize
+            }
+            BufferSize::Default => DEFAULT_BUFFER_SIZE,
+        };
+
+        let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
+        let error_callback = Arc::new(Mutex::new(Box::new(error_callback)));
+
+        // Create the AudioContext for input.
+        let stream_opts = AudioContextOptions::new();
+        stream_opts.set_sample_rate(config.sample_rate as f32);
+        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
+            |err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                let err = BackendSpecificError { description };
+                err.into()
+            },
+        )?;
+
+        // SAFETY: WASM is single-threaded
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx = Arc::new(ctx);
+
+        // Create a ScriptProcessorNode for capturing input samples.
+        let script_node = ctx
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+                buffer_size_frames as u32,
+                n_channels as u32,
+                n_channels as u32,
+            )
+            .map_err(|err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            })?;
+
+        // Set up the onaudioprocess callback.
+        let ctx_handle = ctx.clone();
+        let callback_closure = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
+            let input_buffer = event.input_buffer().unwrap();
+            let n_frames = input_buffer.length() as usize;
+            let mut interleaved = vec![0f32; n_frames * n_channels];
+
+            for channel in 0..n_channels {
+                if let Ok(channel_data) = input_buffer.get_channel_data(channel as u32) {
+                    for (i, &sample) in channel_data.iter().enumerate() {
+                        interleaved[i * n_channels + channel] = sample;
+                    }
+                }
+            }
+
+            let now = ctx_handle.current_time();
+            let len = interleaved.len();
+            let data = interleaved.as_ptr() as *mut ();
+            let data = unsafe { Data::from_parts(data, len, sample_format) };
+            let callback = crate::StreamInstant::from_secs_f64(now);
+            let capture = callback;
+            let timestamp = crate::InputStreamTimestamp { callback, capture };
+            let info = InputCallbackInfo { timestamp };
+            let mut data_callback = data_callback.lock().unwrap();
+            (data_callback.deref_mut())(&data, &info);
+        }) as Box<dyn FnMut(web_sys::AudioProcessingEvent)>);
+
+        script_node.set_onaudioprocess(Some(callback_closure.as_ref().unchecked_ref()));
+        callback_closure.forget();
+
+        // Connect script node to destination (required for it to process).
+        script_node
+            .connect_with_audio_node(&ctx.destination())
+            .map_err(|err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            })?;
+
+        // Request microphone access via getUserMedia and connect to script node.
+        let script_node_clone = script_node.clone();
+        let ctx_clone = ctx.clone();
+        let error_callback_clone = error_callback.clone();
+        let constraints = web_sys::MediaStreamConstraints::new();
+        constraints.set_audio(&JsValue::TRUE);
+
+        let window = web_sys::window().unwrap();
+        let navigator = window.navigator();
+        let media_devices = navigator.media_devices().map_err(|err| -> BuildStreamError {
+            let description = format!("{:?}", err);
+            BackendSpecificError { description }.into()
+        })?;
+
+        let promise = media_devices
+            .get_user_media_with_constraints(&constraints)
+            .map_err(|err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            })?;
+
+        // Handle the getUserMedia promise asynchronously.
+        wasm_bindgen_futures::spawn_local(async move {
+            match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(stream) => {
+                    let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                    match ctx_clone.create_media_stream_source(&media_stream) {
+                        Ok(source) => {
+                            if let Err(err) =
+                                source.connect_with_audio_node(&script_node_clone)
+                            {
+                                let description = format!("{:?}", err);
+                                let err = BackendSpecificError { description };
+                                let mut error_callback = error_callback_clone.lock().unwrap();
+                                (error_callback.deref_mut())(err.into());
+                            }
+                        }
+                        Err(err) => {
+                            let description = format!("{:?}", err);
+                            let err = BackendSpecificError { description };
+                            let mut error_callback = error_callback_clone.lock().unwrap();
+                            (error_callback.deref_mut())(err.into());
+                        }
+                    }
+                }
+                Err(err) => {
+                    let description = format!("{:?}", err);
+                    let err = BackendSpecificError { description };
+                    let mut error_callback = error_callback_clone.lock().unwrap();
+                    (error_callback.deref_mut())(err.into());
+                }
+            }
+        });
+
+        Ok(Stream {
+            ctx,
+            on_ended_closures: Vec::new(),
+            config,
+            buffer_size_frames,
+        })
     }
 
     /// Create an output stream.
