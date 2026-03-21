@@ -18,11 +18,10 @@ use crate::{
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Type alias for shared closure handles used in audio callbacks
-type ClosureHandle = Arc<RwLock<Option<Closure<dyn FnMut()>>>>;
 
 /// Content is false if the iterator is empty.
 pub struct Devices(bool);
@@ -34,9 +33,8 @@ pub struct Host;
 
 pub struct Stream {
     ctx: Arc<AudioContext>,
-    on_ended_closures: Vec<ClosureHandle>,
-    config: StreamConfig,
     buffer_size_frames: usize,
+    _closures: Vec<Box<dyn std::any::Any>>,
 }
 
 // WASM runs in a single-threaded environment, so Send and Sync are safe by design.
@@ -289,7 +287,6 @@ impl DeviceTrait for Device {
         }) as Box<dyn FnMut(web_sys::AudioProcessingEvent)>);
 
         script_node.set_onaudioprocess(Some(callback_closure.as_ref().unchecked_ref()));
-        callback_closure.forget();
 
         // Connect script node to destination (required for it to process).
         script_node
@@ -355,9 +352,8 @@ impl DeviceTrait for Device {
 
         Ok(Stream {
             ctx,
-            on_ended_closures: Vec::new(),
-            config,
             buffer_size_frames,
+            _closures: vec![Box::new(callback_closure)],
         })
     }
 
@@ -389,218 +385,86 @@ impl DeviceTrait for Device {
             }
             BufferSize::Default => DEFAULT_BUFFER_SIZE,
         };
-        let buffer_size_samples = buffer_size_frames * n_channels;
-        let buffer_time_step_secs = buffer_time_step_secs(buffer_size_frames, config.sample_rate);
 
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
 
-        // Create the WebAudio stream.
+        // Create the WebAudio context.
         let stream_opts = AudioContextOptions::new();
         stream_opts.set_sample_rate(config.sample_rate as f32);
         let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
             |err| -> BuildStreamError {
                 let description = format!("{:?}", err);
-                let err = BackendSpecificError { description };
-                err.into()
+                BackendSpecificError { description }.into()
             },
         )?;
 
-        let destination = ctx.destination();
-
-        // If possible, set the destination's channel_count to the given config.channel.
-        // If not, fallback on the default destination channel_count to keep previous behavior
-        // and do not return an error.
-        if config.channels as u32 <= destination.max_channel_count() {
-            destination.set_channel_count(config.channels as u32);
-        }
-
-        // SAFETY: WASM is single-threaded, so Arc is safe even though AudioContext is not Send/Sync
+        // SAFETY: WASM is single-threaded
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx = Arc::new(ctx);
 
-        // A container for managing the lifecycle of the audio callbacks.
-        let mut on_ended_closures: Vec<ClosureHandle> = Vec::new();
+        // Create a ScriptProcessorNode for gapless output.
+        let script_node = ctx
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+                buffer_size_frames as u32,
+                0,
+                n_channels as u32,
+            )
+            .map_err(|err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            })?;
 
-        // A cursor keeping track of the current time at which new frames should be scheduled.
-        let time = Arc::new(RwLock::new(0f64));
+        let ctx_handle = ctx.clone();
+        let callback = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
+            let output_buffer = event.output_buffer().unwrap();
+            let n_frames = output_buffer.length() as usize;
 
-        // baseLatency is fixed for the lifetime of the AudioContext.
-        let base_latency_secs = js_sys::Reflect::get(ctx.as_ref(), &JsValue::from("baseLatency"))
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            let mut temporary_buffer = vec![0f32; n_frames * n_channels];
 
-        // Create a set of closures / callbacks which will continuously fetch and schedule sample
-        // playback. Starting with two workers, e.g. a front and back buffer so that audio frames
-        // can be fetched in the background.
-        for _i in 0..2 {
-            let data_callback_handle = data_callback.clone();
-            let ctx_handle = ctx.clone();
-            let time_handle = time.clone();
-
-            // A set of temporary buffers to be used for intermediate sample transformation steps.
-            let mut temporary_buffer = vec![0f32; buffer_size_samples];
-            let mut temporary_channel_buffer = vec![0f32; buffer_size_frames];
-
-            #[cfg(target_feature = "atomics")]
-            let temporary_channel_array_view: js_sys::Float32Array;
-            #[cfg(target_feature = "atomics")]
+            // Call the data callback to fill the interleaved buffer.
             {
-                let temporary_channel_array = js_sys::ArrayBuffer::new(
-                    (std::mem::size_of::<f32>() * buffer_size_frames) as u32,
-                );
-                temporary_channel_array_view = js_sys::Float32Array::new(&temporary_channel_array);
+                let len = temporary_buffer.len();
+                let data = temporary_buffer.as_mut_ptr() as *mut ();
+                let mut data = unsafe { Data::from_parts(data, len, sample_format) };
+                let mut data_callback = data_callback.lock().unwrap();
+                let now = ctx_handle.current_time();
+                let callback = crate::StreamInstant::from_secs_f64(now);
+                let playback = callback;
+                let timestamp = crate::OutputStreamTimestamp { callback, playback };
+                let info = OutputCallbackInfo { timestamp };
+                (data_callback.deref_mut())(&mut data, &info);
             }
 
-            // Create a webaudio buffer which will be reused to avoid allocations.
-            let ctx_buffer = ctx
-                .create_buffer(
-                    config.channels as u32,
-                    buffer_size_frames as u32,
-                    config.sample_rate as f32,
-                )
-                .map_err(|err| -> BuildStreamError {
-                    let description = format!("{:?}", err);
-                    let err = BackendSpecificError { description };
-                    err.into()
-                })?;
+            // Deinterleave and copy to output channels.
+            for channel in 0..n_channels {
+                let mut channel_data = output_buffer.get_channel_data(channel as u32).unwrap();
+                for i in 0..n_frames {
+                    channel_data[i] = temporary_buffer[n_channels * i + channel];
+                }
+                output_buffer
+                    .copy_to_channel(&channel_data, channel as i32)
+                    .unwrap();
+            }
+        }) as Box<dyn FnMut(web_sys::AudioProcessingEvent)>);
 
-            // A self reference to this closure for passing to future audio event calls.
-            // SAFETY: WASM is single-threaded, so Arc is safe even though Closure is not Send/Sync
-            #[allow(clippy::arc_with_non_send_sync)]
-            let on_ended_closure: ClosureHandle = Arc::new(RwLock::new(None));
-            let on_ended_closure_handle = on_ended_closure.clone();
+        script_node.set_onaudioprocess(Some(callback.as_ref().unchecked_ref()));
 
-            on_ended_closure
-                .write()
-                .unwrap()
-                .replace(Closure::wrap(Box::new(move || {
-                    let now = ctx_handle.current_time();
-                    let time_at_start_of_buffer = {
-                        let time_at_start_of_buffer = time_handle
-                            .read()
-                            .expect("Unable to get a read lock on the time cursor");
-                        // Synchronise first buffer as necessary (eg. keep the time value
-                        // referenced to the context clock).
-                        if *time_at_start_of_buffer > 0.0 {
-                            *time_at_start_of_buffer
-                        } else {
-                            // Schedule the first buffer far enough ahead for the browser's
-                            // internal audio pipeline (baseLatency) plus one full buffer of
-                            // data, so playback starts underrun-free at any buffer size.
-                            now + base_latency_secs + buffer_time_step_secs
-                        }
-                    };
-
-                    // Populate the sample data into an interleaved temporary buffer.
-                    {
-                        let len = temporary_buffer.len();
-                        let data = temporary_buffer.as_mut_ptr() as *mut ();
-                        let mut data = unsafe { Data::from_parts(data, len, sample_format) };
-                        let mut data_callback = data_callback_handle.lock().unwrap();
-                        // outputLatency can change at runtime, so read it each callback.
-                        let output_latency_secs = js_sys::Reflect::get(
-                            ctx_handle.as_ref(),
-                            &JsValue::from("outputLatency"),
-                        )
-                        .ok()
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                        let total_hw_latency_secs = {
-                            let sum = base_latency_secs + output_latency_secs;
-                            if sum.is_finite() {
-                                sum.max(0.0)
-                            } else {
-                                0.0
-                            }
-                        };
-                        let callback = crate::StreamInstant::from_secs_f64(now);
-                        let playback = crate::StreamInstant::from_secs_f64(
-                            time_at_start_of_buffer + total_hw_latency_secs,
-                        );
-                        let timestamp = crate::OutputStreamTimestamp { callback, playback };
-                        let info = OutputCallbackInfo { timestamp };
-                        (data_callback.deref_mut())(&mut data, &info);
-                    }
-
-                    // Deinterleave the sample data and copy into the audio context buffer.
-                    // We do not reference the audio context buffer directly e.g. getChannelData.
-                    // As wasm-bindgen only gives us a copy, not a direct reference.
-                    for channel in 0..n_channels {
-                        for i in 0..buffer_size_frames {
-                            temporary_channel_buffer[i] =
-                                temporary_buffer[n_channels * i + channel];
-                        }
-
-                        #[cfg(not(target_feature = "atomics"))]
-                        {
-                            ctx_buffer
-                                .copy_to_channel(&temporary_channel_buffer, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
-                                );
-                        }
-
-                        // copyToChannel cannot be directly copied into from a SharedArrayBuffer,
-                        // which WASM memory is backed by if the 'atomics' flag is enabled.
-                        // This workaround copies the data into an intermediary buffer first.
-                        // There's a chance browsers may eventually relax that requirement.
-                        // See this issue: https://github.com/WebAudio/web-audio-api/issues/2565
-                        #[cfg(target_feature = "atomics")]
-                        {
-                            temporary_channel_array_view.copy_from(&temporary_channel_buffer);
-                            ctx_buffer
-                                .unchecked_ref::<ExternalArrayAudioBuffer>()
-                                .copy_to_channel(&temporary_channel_array_view, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
-                                );
-                        }
-                    }
-
-                    // Create an AudioBufferSourceNode, schedule it to playback the reused buffer
-                    // in the future.
-                    let source = ctx_handle
-                        .create_buffer_source()
-                        .expect("Unable to create a webaudio buffer source");
-                    source.set_buffer(Some(&ctx_buffer));
-                    source
-                        .connect_with_audio_node(&ctx_handle.destination())
-                        .expect(
-                        "Unable to connect the web audio buffer source to the context destination",
-                    );
-                    source
-                        .add_event_listener_with_callback(
-                            "ended",
-                            on_ended_closure_handle
-                                .read()
-                                .unwrap()
-                                .as_ref()
-                                .unwrap()
-                                .as_ref()
-                                .unchecked_ref(),
-                        )
-                        .expect("Failed to add ended event listener");
-
-                    source
-                        .start_with_when(time_at_start_of_buffer)
-                        .expect("Unable to start the webaudio buffer source");
-
-                    // Keep track of when the next buffer worth of samples should be played.
-                    *time_handle.write().unwrap() = time_at_start_of_buffer + buffer_time_step_secs;
-                }) as Box<dyn FnMut()>));
-
-            on_ended_closures.push(on_ended_closure);
-        }
+        // Connect to destination for output.
+        script_node
+            .connect_with_audio_node(&ctx.destination())
+            .map_err(|err| -> BuildStreamError {
+                let description = format!("{:?}", err);
+                BackendSpecificError { description }.into()
+            })?;
 
         Ok(Stream {
             ctx,
-            on_ended_closures,
-            config,
             buffer_size_frames,
+            _closures: vec![Box::new(callback)],
         })
     }
 }
+
 
 impl Stream {
     /// Return the [`AudioContext`](https://developer.mozilla.org/docs/Web/API/AudioContext) used
@@ -612,32 +476,8 @@ impl Stream {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let window = web_sys::window().unwrap();
         match self.ctx.resume() {
-            Ok(_) => {
-                // Begin webaudio playback, initially scheduling the closures to fire on a timeout
-                // event.
-                let mut offset_ms = 10;
-                let time_step_secs =
-                    buffer_time_step_secs(self.buffer_size_frames, self.config.sample_rate);
-                let time_step_ms = (time_step_secs * 1_000.0) as i32;
-                for on_ended_closure in self.on_ended_closures.iter() {
-                    window
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                            on_ended_closure
-                                .read()
-                                .unwrap()
-                                .as_ref()
-                                .unwrap()
-                                .as_ref()
-                                .unchecked_ref(),
-                            offset_ms,
-                        )
-                        .unwrap();
-                    offset_ms += time_step_ms;
-                }
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(err) => {
                 let description = format!("{:?}", err);
                 let err = BackendSpecificError { description };
@@ -721,9 +561,6 @@ fn valid_config(conf: StreamConfig, sample_format: SampleFormat) -> bool {
         && sample_format == SUPPORTED_SAMPLE_FORMAT
 }
 
-fn buffer_time_step_secs(buffer_size_frames: usize, sample_rate: SampleRate) -> f64 {
-    buffer_size_frames as f64 / sample_rate as f64
-}
 
 #[cfg(target_feature = "atomics")]
 #[wasm_bindgen]
