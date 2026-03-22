@@ -314,7 +314,12 @@ impl DeviceTrait for Device {
         let ctx_clone = ctx.clone();
         let error_callback_clone = error_callback.clone();
         let constraints = web_sys::MediaStreamConstraints::new();
-        constraints.set_audio(&JsValue::TRUE);
+        // Disable Chrome's automatic audio processing that can cause gaps
+        let audio_constraints = js_sys::Object::new();
+        js_sys::Reflect::set(&audio_constraints, &"echoCancellation".into(), &JsValue::FALSE).unwrap();
+        js_sys::Reflect::set(&audio_constraints, &"noiseSuppression".into(), &JsValue::FALSE).unwrap();
+        js_sys::Reflect::set(&audio_constraints, &"autoGainControl".into(), &JsValue::FALSE).unwrap();
+        constraints.set_audio(&audio_constraints.into());
 
         let window = web_sys::window().unwrap();
         let navigator = window.navigator();
