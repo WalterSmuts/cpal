@@ -275,10 +275,9 @@ impl DeviceTrait for Device {
 
         // Set up the onaudioprocess callback.
         let ctx_handle = ctx.clone();
+        let mut interleaved = vec![0f32; buffer_size_frames * n_channels];
         let callback_closure = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
             let input_buffer = event.input_buffer().unwrap();
-            let n_frames = input_buffer.length() as usize;
-            let mut interleaved = vec![0f32; n_frames * n_channels];
 
             for channel in 0..n_channels {
                 if let Ok(channel_data) = input_buffer.get_channel_data(channel as u32) {
@@ -409,7 +408,7 @@ impl DeviceTrait for Device {
         let script_node = ctx
             .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
                 buffer_size_frames as u32,
-                0,
+                1, // Chrome requires at least 1 input channel to fire onaudioprocess
                 n_channels as u32,
             )
             .map_err(|err| -> BuildStreamError {
@@ -418,13 +417,13 @@ impl DeviceTrait for Device {
             })?;
 
         let ctx_handle = ctx.clone();
+        let mut temporary_buffer = vec![0f32; buffer_size_frames * n_channels];
+        let mut temporary_channel_buffer = vec![0f32; buffer_size_frames];
         let callback = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
             let output_buffer = event.output_buffer().unwrap();
             let n_frames = output_buffer.length() as usize;
 
-            let mut temporary_buffer = vec![0f32; n_frames * n_channels];
-
-            // Call the data callback to fill the interleaved buffer.
+            // Fill the interleaved buffer via data callback.
             {
                 let len = temporary_buffer.len();
                 let data = temporary_buffer.as_mut_ptr() as *mut ();
@@ -440,12 +439,11 @@ impl DeviceTrait for Device {
 
             // Deinterleave and copy to output channels.
             for channel in 0..n_channels {
-                let mut channel_data = output_buffer.get_channel_data(channel as u32).unwrap();
                 for i in 0..n_frames {
-                    channel_data[i] = temporary_buffer[n_channels * i + channel];
+                    temporary_channel_buffer[i] = temporary_buffer[n_channels * i + channel];
                 }
                 output_buffer
-                    .copy_to_channel(&channel_data, channel as i32)
+                    .copy_to_channel(&temporary_channel_buffer, channel as i32)
                     .unwrap();
             }
         }) as Box<dyn FnMut(web_sys::AudioProcessingEvent)>);
