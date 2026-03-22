@@ -26,6 +26,15 @@ thread_local! {
     static SHARED_AUDIO_CONTEXT: RefCell<Option<Arc<AudioContext>>> = RefCell::new(None);
 }
 
+/// Close the shared AudioContext and clear the thread-local, stopping all callbacks.
+pub fn close_audio_context() {
+    SHARED_AUDIO_CONTEXT.with(|cell| {
+        if let Some(ctx) = cell.borrow_mut().take() {
+            let _ = ctx.close();
+        }
+    });
+}
+
 fn get_or_create_audio_context(sample_rate: SampleRate) -> Result<Arc<AudioContext>, BuildStreamError> {
     SHARED_AUDIO_CONTEXT.with(|cell| {
         let mut ctx_opt = cell.borrow_mut();

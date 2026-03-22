@@ -826,6 +826,7 @@ mod platform_impl {
         doc(cfg(all(target_arch = "wasm32", feature = "wasm-bindgen")))
     )]
     pub use crate::host::webaudio::Host as WebAudioHost;
+    pub use crate::host::webaudio::close_audio_context;
 
     #[cfg(feature = "audioworklet")]
     #[cfg_attr(
