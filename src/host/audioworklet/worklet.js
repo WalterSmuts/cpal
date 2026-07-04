@@ -14,28 +14,33 @@ registerProcessor("CpalProcessor", class WasmProcessor extends AudioWorkletProce
             this.wasm_memory = new Float32Array(this.memory.buffer);
         }
 
-        // Input mode: a node with inputs and no outputs. Interleave the input
-        // channels into a Wasm-owned buffer and hand them to Rust, which
-        // invokes the input data callback (e.g. the DSP) on the render thread.
-        const input = inputs[0];
-        if (input && input.length > 0 && (outputs.length === 0 || outputs[0].length === 0)) {
-            const in_channels = input.length;
-            const in_frame_size = input[0].length;
-            const in_ptr = this.processor.input_buffer_ptr(in_channels, in_frame_size);
-            const in_start = in_ptr / 4;
-            const mem = this.wasm_memory;
-            const in_total = in_channels * in_frame_size;
-            if (in_start + in_total <= mem.length) {
-                for (let ch = 0; ch < in_channels; ch++) {
-                    const channel = input[ch];
-                    let write_pos = in_start + ch;
-                    for (let i = 0; i < in_frame_size; i++) {
-                        mem[write_pos] = channel[i];
-                        write_pos += in_channels;
+        // Input node: it has an input port (inputs.length > 0). It is connected
+        // to the destination with a silent output ONLY so the render graph
+        // schedules its context (a node with no destination path is never
+        // pulled, so its context may never start rendering). Read input if
+        // present, hand it to Rust, and output silence.
+        if (inputs.length > 0) {
+            const input = inputs[0];
+            if (input && input.length > 0) {
+                const in_channels = input.length;
+                const in_frame_size = input[0].length;
+                const in_ptr = this.processor.input_buffer_ptr(in_channels, in_frame_size);
+                const in_start = in_ptr / 4;
+                const mem = this.wasm_memory;
+                const in_total = in_channels * in_frame_size;
+                if (in_start + in_total <= mem.length) {
+                    for (let ch = 0; ch < in_channels; ch++) {
+                        const channel = input[ch];
+                        let write_pos = in_start + ch;
+                        for (let i = 0; i < in_frame_size; i++) {
+                            mem[write_pos] = channel[i];
+                            write_pos += in_channels;
+                        }
                     }
+                    this.processor.process_input(in_channels, in_frame_size, sampleRate, currentTime);
                 }
-                this.processor.process_input(in_channels, in_frame_size, sampleRate, currentTime);
             }
+            for (const out of outputs) for (const chan of out) chan.fill(0);
             return true;
         }
 

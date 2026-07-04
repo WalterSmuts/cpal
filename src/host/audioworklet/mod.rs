@@ -227,7 +227,13 @@ impl DeviceTrait for Device {
 
                 let options = web_sys::AudioWorkletNodeOptions::new();
                 options.set_number_of_inputs(1);
-                options.set_number_of_outputs(0);
+                // One silent output so the node can be connected to the
+                // destination; otherwise its context has no render path and
+                // never schedules the input worklet.
+                options.set_number_of_outputs(1);
+                let out_ch = js_sys::Array::new();
+                out_ch.push(&JsValue::from_f64(1.0));
+                options.set_output_channel_count(&out_ch);
 
                 options.set_processor_options(Some(&js_sys::Array::of3(
                     &wasm_bindgen::module(),
@@ -257,6 +263,10 @@ impl DeviceTrait for Device {
                     web_sys::AudioWorkletNode::new_with_options(&ctx, "CpalProcessor", &options)?;
 
                 source.connect_with_audio_node(&audio_worklet_node)?;
+                // Connect to the destination so the render graph pulls this
+                // node (and thus starts this context rendering). Output is
+                // silence, so nothing audible is produced.
+                audio_worklet_node.connect_with_audio_node(&ctx.destination())?;
                 Ok(())
             }
             .await;
