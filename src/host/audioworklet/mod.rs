@@ -8,6 +8,7 @@ use js_sys::wasm_bindgen;
 
 use crate::dependent_module;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
@@ -77,8 +78,7 @@ impl HostTrait for Host {
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
-        // TODO
-        None
+        Some(Device)
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
@@ -116,8 +116,19 @@ impl DeviceTrait for Device {
     fn supported_input_configs(
         &self,
     ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
-        // TODO
-        Ok(Vec::new().into_iter())
+        // Mirror the output side: the true channel count is only known once the
+        // browser initializes the worklet / grants the microphone.
+        let buffer_size = SupportedBufferSize::Unknown;
+        let configs: Vec<_> = (MIN_CHANNELS..=MAX_CHANNELS)
+            .map(|channels| SupportedStreamConfigRange {
+                channels,
+                min_sample_rate: MIN_SAMPLE_RATE,
+                max_sample_rate: MAX_SAMPLE_RATE,
+                buffer_size,
+                sample_format: SUPPORTED_SAMPLE_FORMAT,
+            })
+            .collect();
+        Ok(configs.into_iter())
     }
 
     #[inline]
@@ -143,8 +154,14 @@ impl DeviceTrait for Device {
 
     #[inline]
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        // TODO
-        Err(DefaultStreamConfigError::StreamTypeNotSupported)
+        const EXPECT: &str = "expected at least one valid webaudio input config";
+        let config = self
+            .supported_input_configs()
+            .expect(EXPECT)
+            .max_by(|a, b| a.cmp_default_heuristics(b))
+            .unwrap()
+            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+        Ok(config)
     }
 
     #[inline]
@@ -162,18 +179,102 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: StreamConfig,
-        _sample_format: SampleFormat,
-        _data_callback: D,
-        _error_callback: E,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        mut data_callback: D,
+        mut error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        // TODO
-        Err(BuildStreamError::StreamConfigNotSupported)
+        if !valid_config(config, sample_format) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+
+        let stream_opts = web_sys::AudioContextOptions::new();
+        stream_opts.set_sample_rate(config.sample_rate as f32);
+
+        let audio_context = web_sys::AudioContext::new_with_context_options(&stream_opts).map_err(
+            |err| -> BuildStreamError {
+                let description = format!("{err:?}");
+                let err = BackendSpecificError { description };
+                err.into()
+            },
+        )?;
+
+        let ctx = audio_context.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result: Result<(), JsValue> = async move {
+                let mod_url = dependent_module!("worklet.js")?;
+                wasm_bindgen_futures::JsFuture::from(ctx.audio_worklet()?.add_module(&mod_url)?)
+                    .await?;
+
+                // Acquire the microphone via getUserMedia and route it into the
+                // worklet as an input node (no outputs).
+                let window =
+                    web_sys::window().ok_or_else(|| JsValue::from_str("no window available"))?;
+                let media_devices = window.navigator().media_devices()?;
+                let constraints = web_sys::MediaStreamConstraints::new();
+                constraints.set_audio(&JsValue::TRUE);
+                let stream = wasm_bindgen_futures::JsFuture::from(
+                    media_devices.get_user_media_with_constraints(&constraints)?,
+                )
+                .await?
+                .dyn_into::<web_sys::MediaStream>()?;
+                let source = ctx.create_media_stream_source(&stream)?;
+
+                let options = web_sys::AudioWorkletNodeOptions::new();
+                options.set_number_of_inputs(1);
+                options.set_number_of_outputs(0);
+
+                options.set_processor_options(Some(&js_sys::Array::of3(
+                    &wasm_bindgen::module(),
+                    &wasm_bindgen::memory(),
+                    &WasmAudioProcessor::new_input(Box::new(
+                        move |interleaved: &[f32], _frame_size, _sample_rate, now| {
+                            // The buffer is owned by WasmAudioProcessor and only
+                            // read here; cast is sound for a read-only `Data`.
+                            let ptr = interleaved.as_ptr() as *mut ();
+                            let data =
+                                unsafe { Data::from_parts(ptr, interleaved.len(), sample_format) };
+                            let capture = crate::StreamInstant::from_secs_f64(now);
+                            let timestamp = crate::InputStreamTimestamp {
+                                callback: capture,
+                                capture,
+                            };
+                            let info = InputCallbackInfo { timestamp };
+                            (data_callback)(&data, &info);
+                        },
+                    ))
+                    .pack()
+                    .into(),
+                )));
+
+                // This name 'CpalProcessor' must match the name registered in worklet.js
+                let audio_worklet_node =
+                    web_sys::AudioWorkletNode::new_with_options(&ctx, "CpalProcessor", &options)?;
+
+                source.connect_with_audio_node(&audio_worklet_node)?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = result {
+                let description = if let Some(string_value) = err.as_string() {
+                    string_value
+                } else {
+                    format!("Browser error initializing input stream: {err:?}")
+                };
+
+                error_callback(StreamError::BackendSpecific {
+                    err: BackendSpecificError { description },
+                })
+            }
+        });
+
+        Ok(Stream { audio_context })
     }
 
     /// Create an output stream.
@@ -364,6 +465,12 @@ fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Dura
 }
 
 type AudioProcessorCallback = Box<dyn FnMut(&mut [f32], u32, u32, f64)>;
+type InputProcessorCallback = Box<dyn FnMut(&[f32], u32, u32, f64)>;
+
+enum ProcessorCallback {
+    Output(AudioProcessorCallback),
+    Input(InputProcessorCallback),
+}
 
 /// WasmAudioProcessor provides an interface for the Javascript code
 /// running in the AudioWorklet to interact with Rust.
@@ -373,14 +480,23 @@ pub struct WasmAudioProcessor {
     interleaved_buffer: Vec<f32>,
     #[wasm_bindgen(skip)]
     // Passes in an interleaved scratch buffer, frame size, sample rate, and current time.
-    callback: AudioProcessorCallback,
+    callback: ProcessorCallback,
 }
 
 impl WasmAudioProcessor {
     pub fn new(callback: AudioProcessorCallback) -> Self {
         Self {
             interleaved_buffer: Vec::new(),
-            callback,
+            callback: ProcessorCallback::Output(callback),
+        }
+    }
+
+    /// Create a processor that feeds interleaved *input* frames to `callback`
+    /// (used by `build_input_stream_raw`; runs on the audio render thread).
+    pub fn new_input(callback: InputProcessorCallback) -> Self {
+        Self {
+            interleaved_buffer: Vec::new(),
+            callback: ProcessorCallback::Input(callback),
         }
     }
 }
@@ -404,12 +520,14 @@ impl WasmAudioProcessor {
             0.0,
         );
 
-        (self.callback)(
-            &mut self.interleaved_buffer[..interleaved_buffer_size],
-            frame_size as u32,
-            sample_rate,
-            current_time,
-        );
+        if let ProcessorCallback::Output(cb) = &mut self.callback {
+            (cb)(
+                &mut self.interleaved_buffer[..interleaved_buffer_size],
+                frame_size as u32,
+                sample_rate,
+                current_time,
+            );
+        }
 
         // Returns a pointer to the raw interleaved buffer to Javascript so
         // it can deinterleave it into the output buffers.
@@ -419,6 +537,43 @@ impl WasmAudioProcessor {
         // is likely heavily optimized by the browser's JS engine,
         // although I have not tested that assumption.
         self.interleaved_buffer.as_mut_ptr() as _
+    }
+
+    /// Ensure the interleaved input scratch buffer is large enough and return
+    /// its pointer so JS can interleave the input channels into it before
+    /// calling [`process_input`](Self::process_input).
+    pub fn input_buffer_ptr(&mut self, channels: u32, frame_size: u32) -> u32 {
+        let needed = channels as usize * frame_size as usize;
+        self.interleaved_buffer
+            .resize(needed.max(self.interleaved_buffer.len()), 0.0);
+        self.interleaved_buffer.as_mut_ptr() as _
+    }
+
+    /// Invoke the input callback with the interleaved frames JS just wrote
+    /// into the buffer returned by [`input_buffer_ptr`](Self::input_buffer_ptr).
+    pub fn process_input(
+        &mut self,
+        channels: u32,
+        frame_size: u32,
+        sample_rate: u32,
+        current_time: f64,
+    ) {
+        let n = channels as usize * frame_size as usize;
+        if n > self.interleaved_buffer.len() {
+            return;
+        }
+        let Self {
+            interleaved_buffer,
+            callback,
+        } = self;
+        if let ProcessorCallback::Input(cb) = callback {
+            (cb)(
+                &interleaved_buffer[..n],
+                frame_size,
+                sample_rate,
+                current_time,
+            );
+        }
     }
 
     /// Converts this `WasmAudioProcessor` into a raw pointer (as `usize`) for FFI use.
