@@ -19,6 +19,7 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::ops::DerefMut;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,6 +70,14 @@ pub struct Host;
 pub struct Stream {
     ctx: Arc<AudioContext>,
     buffer_size_frames: usize,
+    /// The ScriptProcessorNode driving this stream's callbacks. Detached on
+    /// drop: the AudioContext is shared with other streams and stays open,
+    /// so a still-connected node would keep firing into a freed closure.
+    script_node: web_sys::ScriptProcessorNode,
+    /// Input streams: the capture MediaStream, filled in by the async
+    /// getUserMedia path. Its tracks are stopped on drop so replacing an
+    /// input stream (e.g. switching microphones) releases the old device.
+    media_stream: Rc<RefCell<Option<web_sys::MediaStream>>>,
     _closures: Vec<Box<dyn std::any::Any>>,
 }
 
@@ -351,11 +360,23 @@ impl DeviceTrait for Device {
                 BackendSpecificError { description }.into()
             })?;
 
-        // Handle the getUserMedia promise asynchronously.
+        // Handle the getUserMedia promise asynchronously. The Stream keeps a
+        // shared handle to the resulting MediaStream so dropping it can stop
+        // the capture tracks (releasing the microphone).
+        let media_stream_handle: Rc<RefCell<Option<web_sys::MediaStream>>> =
+            Rc::new(RefCell::new(None));
+        let media_stream_handle_async = media_stream_handle.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match wasm_bindgen_futures::JsFuture::from(promise).await {
                 Ok(stream) => {
                     let media_stream: web_sys::MediaStream = stream.unchecked_into();
+                    // If the Stream was dropped while getUserMedia was
+                    // pending, release the microphone immediately.
+                    if Rc::strong_count(&media_stream_handle_async) == 1 {
+                        stop_media_stream(&media_stream);
+                        return;
+                    }
+                    *media_stream_handle_async.borrow_mut() = Some(media_stream.clone());
                     match ctx_clone.create_media_stream_source(&media_stream) {
                         Ok(source) => {
                             if let Err(err) =
@@ -387,6 +408,8 @@ impl DeviceTrait for Device {
         Ok(Stream {
             ctx,
             buffer_size_frames,
+            script_node,
+            media_stream: media_stream_handle,
             _closures: vec![Box::new(callback_closure)],
         })
     }
@@ -482,6 +505,8 @@ impl DeviceTrait for Device {
         Ok(Stream {
             ctx,
             buffer_size_frames,
+            script_node,
+            media_stream: Rc::new(RefCell::new(None)),
             _closures: vec![Box::new(callback)],
         })
     }
@@ -526,7 +551,25 @@ impl StreamTrait for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // Don't close the shared AudioContext — other streams may still use it.
+        // Detach this stream's node from the graph before its callback
+        // closure is freed; the shared AudioContext stays open — other
+        // streams may still use it.
+        self.script_node.set_onaudioprocess(None);
+        self.script_node.disconnect().ok();
+        // Input streams: stop the capture tracks so the microphone is
+        // released (closing nodes alone leaves the MediaStream live).
+        if let Some(stream) = self.media_stream.borrow_mut().take() {
+            stop_media_stream(&stream);
+        }
+    }
+}
+
+/// Stop every track of a MediaStream, releasing the underlying device.
+fn stop_media_stream(stream: &web_sys::MediaStream) {
+    for track in stream.get_tracks().iter() {
+        if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+            track.stop();
+        }
     }
 }
 
