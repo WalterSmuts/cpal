@@ -205,6 +205,10 @@ impl DeviceTrait for Device {
         )?;
 
         let ctx = audio_context.clone();
+        // Snapshot the app's microphone selection now (see `crate::web`):
+        // the async setup below runs after the caller returns and must not
+        // observe a preference set for a later stream.
+        let preferred_device_id = crate::web::preferred_input_device_id();
         wasm_bindgen_futures::spawn_local(async move {
             let result: Result<(), JsValue> = async move {
                 let mod_url = dependent_module!("worklet.js")?;
@@ -217,7 +221,19 @@ impl DeviceTrait for Device {
                     web_sys::window().ok_or_else(|| JsValue::from_str("no window available"))?;
                 let media_devices = window.navigator().media_devices()?;
                 let constraints = web_sys::MediaStreamConstraints::new();
-                constraints.set_audio(&JsValue::TRUE);
+                let audio: JsValue = match &preferred_device_id {
+                    // `exact` so a stale id errors instead of capturing
+                    // another device.
+                    Some(id) => {
+                        let audio = js_sys::Object::new();
+                        let device_id = js_sys::Object::new();
+                        js_sys::Reflect::set(&device_id, &"exact".into(), &JsValue::from_str(id))?;
+                        js_sys::Reflect::set(&audio, &"deviceId".into(), &device_id)?;
+                        audio.into()
+                    }
+                    None => JsValue::TRUE,
+                };
+                constraints.set_audio(&audio);
                 let stream = wasm_bindgen_futures::JsFuture::from(
                     media_devices.get_user_media_with_constraints(&constraints)?,
                 )

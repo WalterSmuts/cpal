@@ -328,6 +328,13 @@ impl DeviceTrait for Device {
         js_sys::Reflect::set(&audio_constraints, &"echoCancellation".into(), &JsValue::FALSE).unwrap();
         js_sys::Reflect::set(&audio_constraints, &"noiseSuppression".into(), &JsValue::FALSE).unwrap();
         js_sys::Reflect::set(&audio_constraints, &"autoGainControl".into(), &JsValue::FALSE).unwrap();
+        // Honor the app's microphone selection (see `crate::web`); `exact`
+        // so a stale id errors instead of capturing another device.
+        if let Some(id) = crate::web::preferred_input_device_id() {
+            let device_id = js_sys::Object::new();
+            js_sys::Reflect::set(&device_id, &"exact".into(), &id.into()).unwrap();
+            js_sys::Reflect::set(&audio_constraints, &"deviceId".into(), &device_id).unwrap();
+        }
         constraints.set_audio(&audio_constraints.into());
 
         let window = web_sys::window().unwrap();

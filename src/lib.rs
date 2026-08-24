@@ -197,6 +197,8 @@ mod host;
 pub mod platform;
 mod samples_formats;
 pub mod traits;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
+pub mod web;
 
 /// Iterator of devices wrapped in a filter to only include certain device types
 pub type DevicesFiltered<I> = std::iter::Filter<I, fn(&<I as Iterator>::Item) -> bool>;
