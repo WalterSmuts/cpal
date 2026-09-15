@@ -39,8 +39,54 @@ const MIN_CHANNELS: ChannelCount = 1;
 const MAX_CHANNELS: ChannelCount = 32;
 const MIN_SAMPLE_RATE: SampleRate = 8_000;
 const MAX_SAMPLE_RATE: SampleRate = 96_000;
-const DEFAULT_SAMPLE_RATE: SampleRate = 44_100;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
+
+thread_local! {
+    static NATIVE_SAMPLE_RATE: std::cell::Cell<Option<SampleRate>> = const { std::cell::Cell::new(None) };
+}
+
+/// The rate the browser's audio hardware runs at, probed once with a
+/// throwaway context created without a requested rate. Default configs
+/// report this so callers process audio at the true device rate instead of
+/// forcing the browser to resample around a guess.
+fn native_sample_rate() -> Result<SampleRate, DefaultStreamConfigError> {
+    NATIVE_SAMPLE_RATE.with(|cell| {
+        if let Some(rate) = cell.get() {
+            return Ok(rate);
+        }
+        let ctx = web_sys::AudioContext::new().map_err(|err| {
+            let description = format!("{err:?}");
+            DefaultStreamConfigError::BackendSpecific {
+                err: BackendSpecificError { description },
+            }
+        })?;
+        let rate = ctx.sample_rate() as SampleRate;
+        let _ = ctx.close();
+        cell.set(Some(rate));
+        Ok(rate)
+    })
+}
+
+/// Create a context at `config.sample_rate`. A browser may ignore the
+/// requested rate and open at its own, which would silently skew every
+/// frequency the caller computes; refuse rather than deliver mis-rated audio.
+fn create_audio_context(config: &StreamConfig) -> Result<web_sys::AudioContext, BuildStreamError> {
+    let stream_opts = web_sys::AudioContextOptions::new();
+    stream_opts.set_sample_rate(config.sample_rate as f32);
+
+    let audio_context = web_sys::AudioContext::new_with_context_options(&stream_opts).map_err(
+        |err| -> BuildStreamError {
+            let description = format!("{err:?}");
+            let err = BackendSpecificError { description };
+            err.into()
+        },
+    )?;
+    if audio_context.sample_rate() as SampleRate != config.sample_rate {
+        let _ = audio_context.close();
+        return Err(BuildStreamError::StreamConfigNotSupported);
+    }
+    Ok(audio_context)
+}
 
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
@@ -160,7 +206,7 @@ impl DeviceTrait for Device {
             .expect(EXPECT)
             .max_by(|a, b| a.cmp_default_heuristics(b))
             .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+            .with_sample_rate(native_sample_rate()?);
         Ok(config)
     }
 
@@ -172,7 +218,7 @@ impl DeviceTrait for Device {
             .expect(EXPECT)
             .max_by(|a, b| a.cmp_default_heuristics(b))
             .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+            .with_sample_rate(native_sample_rate()?);
 
         Ok(config)
     }
@@ -193,16 +239,7 @@ impl DeviceTrait for Device {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
-        let stream_opts = web_sys::AudioContextOptions::new();
-        stream_opts.set_sample_rate(config.sample_rate as f32);
-
-        let audio_context = web_sys::AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{err:?}");
-                let err = BackendSpecificError { description };
-                err.into()
-            },
-        )?;
+        let audio_context = create_audio_context(&config)?;
 
         let ctx = audio_context.clone();
         // Snapshot the app's microphone selection now (see `crate::web`):
@@ -320,16 +357,7 @@ impl DeviceTrait for Device {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
-        let stream_opts = web_sys::AudioContextOptions::new();
-        stream_opts.set_sample_rate(config.sample_rate as f32);
-
-        let audio_context = web_sys::AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{err:?}");
-                let err = BackendSpecificError { description };
-                err.into()
-            },
-        )?;
+        let audio_context = create_audio_context(&config)?;
 
         let destination = audio_context.destination();
 

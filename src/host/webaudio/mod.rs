@@ -36,25 +36,53 @@ pub fn close_audio_context() {
     });
 }
 
-fn get_or_create_audio_context(sample_rate: SampleRate) -> Result<Arc<AudioContext>, BuildStreamError> {
+/// Get the shared AudioContext, creating it if needed. `None` lets the
+/// browser pick its native hardware rate; `Some(rate)` requests that rate
+/// and fails with `StreamConfigNotSupported` if the context (existing or
+/// newly created) runs at a different one, since a context's rate is fixed
+/// for its lifetime and shared by every stream.
+fn get_or_create_audio_context(
+    sample_rate: Option<SampleRate>,
+) -> Result<Arc<AudioContext>, BuildStreamError> {
     SHARED_AUDIO_CONTEXT.with(|cell| {
         let mut ctx_opt = cell.borrow_mut();
-        if let Some(ctx) = ctx_opt.as_ref() {
-            return Ok(ctx.clone());
+        let ctx = match ctx_opt.as_ref() {
+            Some(ctx) => ctx.clone(),
+            None => {
+                let stream_opts = AudioContextOptions::new();
+                if let Some(rate) = sample_rate {
+                    stream_opts.set_sample_rate(rate as f32);
+                }
+                let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
+                    |err| -> BuildStreamError {
+                        let description = format!("{:?}", err);
+                        BackendSpecificError { description }.into()
+                    },
+                )?;
+                #[allow(clippy::arc_with_non_send_sync)]
+                let ctx = Arc::new(ctx);
+                *ctx_opt = Some(ctx.clone());
+                ctx
+            }
+        };
+        if sample_rate.is_some_and(|rate| ctx.sample_rate() as SampleRate != rate) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
         }
-        let stream_opts = AudioContextOptions::new();
-        stream_opts.set_sample_rate(sample_rate as f32);
-        let ctx = AudioContext::new_with_context_options(&stream_opts).map_err(
-            |err| -> BuildStreamError {
-                let description = format!("{:?}", err);
-                BackendSpecificError { description }.into()
-            },
-        )?;
-        #[allow(clippy::arc_with_non_send_sync)]
-        let ctx = Arc::new(ctx);
-        *ctx_opt = Some(ctx.clone());
         Ok(ctx)
     })
+}
+
+/// The rate the browser's audio hardware runs at, i.e. the shared context's
+/// rate. Default configs report this so callers process audio at the true
+/// device rate instead of forcing the browser to resample around a guess.
+fn native_sample_rate() -> Result<SampleRate, DefaultStreamConfigError> {
+    let ctx = get_or_create_audio_context(None).map_err(|err| match err {
+        BuildStreamError::BackendSpecific { err } => {
+            DefaultStreamConfigError::BackendSpecific { err }
+        }
+        _ => DefaultStreamConfigError::DeviceNotAvailable,
+    })?;
+    Ok(ctx.sample_rate() as SampleRate)
 }
 
 /// Type alias for shared closure handles used in audio callbacks
@@ -95,7 +123,6 @@ const MIN_CHANNELS: u16 = 1;
 const MAX_CHANNELS: u16 = 32;
 const MIN_SAMPLE_RATE: SampleRate = 8_000;
 const MAX_SAMPLE_RATE: SampleRate = 96_000;
-const DEFAULT_SAMPLE_RATE: SampleRate = 44_100;
 const MIN_BUFFER_SIZE: u32 = 1;
 const MAX_BUFFER_SIZE: u32 = u32::MAX;
 const DEFAULT_BUFFER_SIZE: usize = 2048;
@@ -195,7 +222,7 @@ impl Device {
             .expect(EXPECT)
             .max_by(|a, b| a.cmp_default_heuristics(b))
             .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+            .with_sample_rate(native_sample_rate()?);
         Ok(config)
     }
 
@@ -206,7 +233,7 @@ impl Device {
             .expect(EXPECT)
             .max_by(|a, b| a.cmp_default_heuristics(b))
             .unwrap()
-            .with_sample_rate(DEFAULT_SAMPLE_RATE);
+            .with_sample_rate(native_sample_rate()?);
 
         Ok(config)
     }
@@ -277,7 +304,7 @@ impl DeviceTrait for Device {
         let error_callback = Arc::new(Mutex::new(Box::new(error_callback)));
 
         // Reuse shared AudioContext for input.
-        let ctx = get_or_create_audio_context(config.sample_rate)?;
+        let ctx = get_or_create_audio_context(Some(config.sample_rate))?;
 
         // Create a ScriptProcessorNode for capturing input samples.
         let script_node = ctx
@@ -446,7 +473,7 @@ impl DeviceTrait for Device {
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
 
         // Reuse shared AudioContext for output.
-        let ctx = get_or_create_audio_context(config.sample_rate)?;
+        let ctx = get_or_create_audio_context(Some(config.sample_rate))?;
 
         // Create a ScriptProcessorNode for gapless output.
         let script_node = ctx
